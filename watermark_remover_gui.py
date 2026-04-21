@@ -301,6 +301,28 @@ _ZH = {
     "Progress: {}/{}": "进度：{}/{}",
     "Processing...": "处理中...",
     "Drag and drop files here": "拖入文件到此",
+
+    "Open Video...": "打开视频...",
+    "Process Video": "处理视频",
+    "Video": "视频",
+    "Method: (fast) cv2 inpaint / (slow) LaMa": "方法：(快) cv2 补全 / (慢) LaMa",
+    "Export video to:": "导出视频到：",
+    "Processing frame {}/{}": "处理帧 {}/{}",
+    "Video done. Output: {}": "视频完成。输出：{}",
+    "Cannot open video": "无法打开视频",
+    "Quick Templates": "快速模板",
+    "Template applied": "模板已应用",
+    "Preview result": "预览结果",
+    "Apply": "应用",
+    "Deep Clean": "深度清理",
+    "Show Loupe (L)": "显示放大镜 (L)",
+    "Loupe": "放大镜",
+    "Hotkeys: R rect / B brush / P polygon / C color / L loupe / Del delete region":
+        "快捷键: R 矩形 / B 画笔 / P 多边形 / C 颜色 / L 放大镜 / Del 删除选区",
+    "Nothing detected after pass {}. Stopping.": "第 {} 轮后未检测到残留，停止。",
+    "Deep clean pass {}/{}": "深度清理：第 {}/{} 轮",
+    "Selected region #{}": "已选中选区 #{}",
+    "Deleted region": "已删除选区",
 }
 
 
@@ -308,6 +330,26 @@ def t(s):
     if LANG == "zh":
         return _ZH.get(s, s)
     return s
+
+
+# Each template is a list of (x1, y1, x2, y2) in relative 0..1 coords
+# of the image. Positions are rough heuristics; users can adjust.
+PLATFORM_TEMPLATES = {
+    "豆包AI (右下)": [(0.72, 0.92, 0.99, 0.99)],
+    "抖音 / 用户ID (右下)": [(0.60, 0.90, 0.99, 0.99)],
+    "抖音 / 大 LOGO (左上)": [(0.01, 0.01, 0.18, 0.10)],
+    "快手 (右下用户名)": [(0.58, 0.91, 0.99, 0.99)],
+    "小红书 (右下)": [(0.65, 0.92, 0.99, 0.99)],
+    "B 站 / bilibili (右上)": [(0.72, 0.01, 0.99, 0.10)],
+    "微博 (底部条)": [(0.00, 0.94, 1.00, 0.99)],
+    "即梦 AI (右下)": [(0.68, 0.92, 0.99, 0.99)],
+    "Midjourney 水印 (左下)": [(0.01, 0.92, 0.25, 0.99)],
+    "DALL·E 彩色条 (右下)": [(0.80, 0.92, 0.99, 0.99)],
+    "Getty Images (居中大水印)": [(0.05, 0.35, 0.95, 0.65)],
+    "Shutterstock (斜向)": [(0.00, 0.20, 1.00, 0.80)],
+}
+
+VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v", ".flv")
 
 
 # --------------------------------------------- OOXML archive helpers
@@ -511,6 +553,18 @@ class WatermarkRemover:
         self.undo_stack = []
         self.redo_stack = []
 
+        # Rect editing: currently-selected rect index + drag state.
+        self.selected_rect_idx = None
+        self.rect_drag = None  # (orig_rect, start_ix, start_iy)
+
+        # Loupe window.
+        self.loupe_win = None
+        self.loupe_canvas = None
+        self.loupe_photo = None
+
+        # Video source state.
+        self.video_path = None
+
         self._build_menu()
         self._build_layout()
         self._bind_events()
@@ -567,13 +621,27 @@ class WatermarkRemover:
         tools_menu.add_command(label=t("Detect text (OCR)"), command=self.ocr_detect)
         tools_menu.add_command(label=t("Select by color..."), command=self.begin_color_pick)
         tools_menu.add_separator()
+        tools_menu.add_command(label=t("Deep Clean"), command=self.deep_clean)
+        tools_menu.add_command(label=t("Show Loupe (L)"), command=self.toggle_loupe)
         tools_menu.add_command(label=t("Compare (before/after)"),
                                command=self.show_compare)
+
+        video_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label=t("Video"), menu=video_menu)
+        video_menu.add_command(label=t("Open Video..."), command=self.open_video)
+        video_menu.add_command(label=t("Process Video"), command=self.process_video)
 
         tpl_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label=t("Template"), menu=tpl_menu)
         tpl_menu.add_command(label=t("Save Template..."), command=self.save_template)
         tpl_menu.add_command(label=t("Load Template..."), command=self.load_template)
+        tpl_menu.add_separator()
+        quick_menu = tk.Menu(tpl_menu, tearoff=0)
+        tpl_menu.add_cascade(label=t("Quick Templates"), menu=quick_menu)
+        for name in PLATFORM_TEMPLATES:
+            quick_menu.add_command(
+                label=name,
+                command=lambda n=name: self.apply_platform_template(n))
 
         lang_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Language / 语言", menu=lang_menu)
@@ -668,6 +736,8 @@ class WatermarkRemover:
                                      command=self.remove_watermark, bg="lightgreen",
                                      font=("Arial", 11, "bold"))
         self.process_btn.pack(fill=tk.X, pady=4)
+        tk.Button(btn_frame, text=t("Deep Clean"),
+                  command=self.deep_clean, bg="#aed581").pack(fill=tk.X, pady=2)
         self.batch_btn = tk.Button(btn_frame, text=t("Batch: Apply to ALL Word Images"),
                                    command=self.batch_remove_doc, bg="#c5e1a5",
                                    font=("Arial", 10, "bold"))
@@ -725,6 +795,19 @@ class WatermarkRemover:
         self.root.bind("<minus>", lambda e: self.zoom_step(1 / 1.25))
         self.root.bind("<Key-0>", lambda e: self.reset_view())
         self.root.bind("<Return>", lambda e: self.finalize_polygon())
+        # Tool mode hotkeys
+        self.root.bind("<Key-r>", lambda e: self._set_tool("rect"))
+        self.root.bind("<Key-R>", lambda e: self._set_tool("rect"))
+        self.root.bind("<Key-b>", lambda e: self._set_tool("brush"))
+        self.root.bind("<Key-B>", lambda e: self._set_tool("brush"))
+        self.root.bind("<Key-p>", lambda e: self._set_tool("polygon"))
+        self.root.bind("<Key-P>", lambda e: self._set_tool("polygon"))
+        self.root.bind("<Key-c>", lambda e: self._set_tool("color"))
+        self.root.bind("<Key-C>", lambda e: self._set_tool("color"))
+        self.root.bind("<Key-l>", lambda e: self.toggle_loupe())
+        self.root.bind("<Key-L>", lambda e: self.toggle_loupe())
+        self.root.bind("<Delete>", lambda e: self._delete_selected_rect())
+        self.root.bind("<BackSpace>", lambda e: self._delete_selected_rect())
 
     def _setup_dnd(self):
         if not HAVE_DND:
@@ -1149,11 +1232,19 @@ class WatermarkRemover:
 
     def _redraw_overlay(self):
         self.canvas.delete("rect")
-        for (x1, y1, x2, y2) in self.rects:
+        for idx, (x1, y1, x2, y2) in enumerate(self.rects):
             cx1, cy1 = self._image_to_canvas(x1, y1)
             cx2, cy2 = self._image_to_canvas(x2, y2)
+            is_sel = idx == self.selected_rect_idx
+            color = "#00ffff" if is_sel else "red"
+            width = 3 if is_sel else 2
             self.canvas.create_rectangle(cx1, cy1, cx2, cy2,
-                                         outline="red", width=2, tags="rect")
+                                         outline=color, width=width, tags="rect")
+            if is_sel:
+                for hx, hy in ((cx1, cy1), (cx2, cy1), (cx1, cy2), (cx2, cy2)):
+                    self.canvas.create_rectangle(hx - 4, hy - 4, hx + 4, hy + 4,
+                                                 outline=color, fill=color,
+                                                 tags="rect")
         if self.in_progress:
             x1, y1, x2, y2 = self.in_progress
             cx1, cy1 = self._image_to_canvas(x1, y1)
@@ -1175,6 +1266,28 @@ class WatermarkRemover:
                                         fill="orange", outline="red", tags="rect")
 
     # -------------------- mouse
+    def _set_tool(self, name):
+        if name in ("rect", "brush", "polygon", "color"):
+            self.tool_mode.set(name)
+
+    def _rect_hit_test(self, ix, iy):
+        """Return index of rect under (ix, iy), or None."""
+        for idx in range(len(self.rects) - 1, -1, -1):  # top-most first
+            x1, y1, x2, y2 = self.rects[idx]
+            if min(x1, x2) <= ix <= max(x1, x2) and min(y1, y2) <= iy <= max(y1, y2):
+                return idx
+        return None
+
+    def _delete_selected_rect(self):
+        if self.selected_rect_idx is None:
+            return
+        if 0 <= self.selected_rect_idx < len(self.rects):
+            self.rects.pop(self.selected_rect_idx)
+            self.selected_rect_idx = None
+            self._redraw_overlay()
+            self._update_coord_text()
+            self.log(t("Deleted region"))
+
     def on_left_down(self, event):
         if self.cv_image is None:
             return
@@ -1189,6 +1302,18 @@ class WatermarkRemover:
         ix, iy = self._canvas_to_image(event.x, event.y)
 
         if mode == "rect":
+            # If we click inside an existing rect, select it and start a move.
+            hit = self._rect_hit_test(ix, iy)
+            if hit is not None:
+                self.selected_rect_idx = hit
+                self.rect_drag = (tuple(self.rects[hit]), ix, iy)
+                self.drawing = True
+                self._redraw_overlay()
+                self.log(t("Selected region #{}").format(hit + 1))
+                return
+            # Clicking empty space deselects and starts a new rect.
+            self.selected_rect_idx = None
+            self.rect_drag = None
             self.in_progress = (ix, iy, ix, iy)
             self.drawing = True
             self._redraw_overlay()
@@ -1212,10 +1337,20 @@ class WatermarkRemover:
         ix, iy = self._canvas_to_image(event.x, event.y)
         mode = self.tool_mode.get()
         if mode == "rect":
-            x1, y1, _, _ = self.in_progress
-            self.in_progress = (x1, y1, ix, iy)
-            self._redraw_overlay()
-            self._update_coord_text()
+            if self.rect_drag is not None:
+                # Moving an existing rect.
+                (ox1, oy1, ox2, oy2), sx, sy = self.rect_drag
+                dx = ix - sx
+                dy = iy - sy
+                self.rects[self.selected_rect_idx] = (ox1 + dx, oy1 + dy,
+                                                      ox2 + dx, oy2 + dy)
+                self._redraw_overlay()
+                self._update_coord_text()
+            elif self.in_progress is not None:
+                x1, y1, _, _ = self.in_progress
+                self.in_progress = (x1, y1, ix, iy)
+                self._redraw_overlay()
+                self._update_coord_text()
         elif mode == "brush":
             self._paint_brush(ix, iy)
             self.display_image()
@@ -1228,15 +1363,20 @@ class WatermarkRemover:
             return
         self.drawing = False
         mode = self.tool_mode.get()
-        if mode == "rect" and self.in_progress:
-            x1, y1, x2, y2 = self.in_progress
-            x1, x2 = min(x1, x2), max(x1, x2)
-            y1, y2 = min(y1, y2), max(y1, y2)
-            if (x2 - x1) >= 2 and (y2 - y1) >= 2:
-                self.rects.append((x1, y1, x2, y2))
-            self.in_progress = None
-            self._redraw_overlay()
-            self._update_coord_text()
+        if mode == "rect":
+            if self.rect_drag is not None:
+                self.rect_drag = None
+                self._redraw_overlay()
+                self._update_coord_text()
+            elif self.in_progress:
+                x1, y1, x2, y2 = self.in_progress
+                x1, x2 = min(x1, x2), max(x1, x2)
+                y1, y2 = min(y1, y2), max(y1, y2)
+                if (x2 - x1) >= 2 and (y2 - y1) >= 2:
+                    self.rects.append((x1, y1, x2, y2))
+                self.in_progress = None
+                self._redraw_overlay()
+                self._update_coord_text()
 
     def on_left_double(self, event):
         if self.tool_mode.get() == "polygon":
@@ -1269,6 +1409,9 @@ class WatermarkRemover:
             self.canvas.create_oval(
                 event.x - r, event.y - r, event.x + r, event.y + r,
                 outline="yellow", width=1, tags="cursor")
+        if self.loupe_win is not None:
+            ix, iy = self._canvas_to_image(event.x, event.y)
+            self._update_loupe(ix, iy)
 
     def on_pan_start(self, event):
         if self.cv_image is None:
@@ -1492,18 +1635,20 @@ class WatermarkRemover:
             pass
 
     def remove_watermark(self):
+        self._remove_core(show_preview=True, show_success=True)
+
+    def _remove_core(self, show_preview=True, show_success=False):
         if self.cv_image is None:
             messagebox.showerror(t("Error"), t("Please open an image first"))
-            return
+            return False
         if not self.rects and (self.extra_mask is None or self.extra_mask.max() == 0):
             messagebox.showerror(t("Error"), t("Draw at least one region first"))
-            return
+            return False
         h, w = self.cv_image.shape[:2]
         mask = self._build_combined_mask(h, w)
         if mask.max() == 0:
             messagebox.showerror(t("Error"), t("Selection is empty"))
-            return
-        self._push_undo()
+            return False
         self.log(t("Removing watermark..."))
         self.process_btn.config(state="disabled")
         self.batch_btn.config(state="disabled")
@@ -1512,30 +1657,55 @@ class WatermarkRemover:
         self.root.update()
         try:
             result = self._run_iopaint(self.cv_image, mask, TEMP_ROOT)
-            self.cv_image = result
-            self.rects = []
-            self.in_progress = None
-            self.extra_mask = None
-            self.polygon_points = []
-            self._update_coord_text()
-            self.display_image()
-            self.log(t("Done."))
-            messagebox.showinfo(t("Success"), t("Watermark removed"))
         except subprocess.CalledProcessError as e:
             err = (e.stderr or e.stdout or "")[-800:]
             self.log(t("iopaint failed:\n") + err)
             messagebox.showerror(t("Error"), t("iopaint failed:\n") + err)
-        except subprocess.TimeoutExpired:
-            self.log(t("iopaint timed out (>10min)"))
-            messagebox.showerror(t("Error"), t("iopaint timed out (>10min)"))
-        except Exception as e:
-            self.log(t("Failed: ") + str(e))
-            messagebox.showerror(t("Error"), t("Failed: ") + str(e))
-        finally:
             self._stop_progress()
             self.process_btn.config(state="normal")
             self.batch_btn.config(state="normal")
             self.root.config(cursor="")
+            return False
+        except subprocess.TimeoutExpired:
+            self.log(t("iopaint timed out (>10min)"))
+            messagebox.showerror(t("Error"), t("iopaint timed out (>10min)"))
+            self._stop_progress()
+            self.process_btn.config(state="normal")
+            self.batch_btn.config(state="normal")
+            self.root.config(cursor="")
+            return False
+        except Exception as e:
+            self.log(t("Failed: ") + str(e))
+            messagebox.showerror(t("Error"), t("Failed: ") + str(e))
+            self._stop_progress()
+            self.process_btn.config(state="normal")
+            self.batch_btn.config(state="normal")
+            self.root.config(cursor="")
+            return False
+
+        self._stop_progress()
+        self.process_btn.config(state="normal")
+        self.batch_btn.config(state="normal")
+        self.root.config(cursor="")
+
+        if show_preview:
+            if not self._preview_remove_result(result):
+                self.log(t("Cancel"))
+                return False
+
+        self._push_undo()
+        self.cv_image = result
+        self.rects = []
+        self.in_progress = None
+        self.extra_mask = None
+        self.polygon_points = []
+        self.selected_rect_idx = None
+        self._update_coord_text()
+        self.display_image()
+        self.log(t("Done."))
+        if show_success:
+            messagebox.showinfo(t("Success"), t("Watermark removed"))
+        return True
 
     # -------------------- batch modes
     def batch_remove_doc(self):
@@ -2057,6 +2227,265 @@ class WatermarkRemover:
         r.configure(image=p2)
         l.image = p1
         r.image = p2
+
+    # -------------------- platform templates
+    def apply_platform_template(self, name):
+        if self.cv_image is None:
+            messagebox.showwarning(t("Warning"), t("Please open an image first"))
+            return
+        tpl = PLATFORM_TEMPLATES.get(name)
+        if not tpl:
+            return
+        h, w = self.cv_image.shape[:2]
+        for rx1, ry1, rx2, ry2 in tpl:
+            self.rects.append((rx1 * w, ry1 * h, rx2 * w, ry2 * h))
+        self._redraw_overlay()
+        self._update_coord_text()
+        self.log(t("Template applied") + ": " + name)
+
+    # -------------------- loupe
+    def toggle_loupe(self):
+        if self.loupe_win is not None and self.loupe_win.winfo_exists():
+            self.loupe_win.destroy()
+            self.loupe_win = None
+            self.loupe_canvas = None
+            return
+        if self.cv_image is None:
+            messagebox.showwarning(t("Warning"), t("Please open an image first"))
+            return
+        self.loupe_win = tk.Toplevel(self.root)
+        self.loupe_win.title(t("Loupe"))
+        self.loupe_win.geometry("360x360+{}+{}".format(
+            self.root.winfo_x() + self.root.winfo_width() - 380,
+            self.root.winfo_y() + 40,
+        ))
+        self.loupe_win.resizable(False, False)
+        self.loupe_win.attributes("-topmost", True)
+        self.loupe_canvas = tk.Canvas(self.loupe_win, bg="black",
+                                      width=340, height=340)
+        self.loupe_canvas.pack(padx=5, pady=5)
+
+    def _update_loupe(self, ix, iy):
+        if self.loupe_win is None or not self.loupe_win.winfo_exists():
+            self.loupe_win = None
+            self.loupe_canvas = None
+            return
+        if self.cv_image is None:
+            return
+        h, w = self.cv_image.shape[:2]
+        crop = 60
+        x0 = max(0, int(ix) - crop)
+        y0 = max(0, int(iy) - crop)
+        x1 = min(w, int(ix) + crop)
+        y1 = min(h, int(iy) + crop)
+        if x1 <= x0 or y1 <= y0:
+            return
+        patch = self.cv_image[y0:y1, x0:x1]
+        if patch.size == 0:
+            return
+        # 3x zoom
+        zoomed = cv2.resize(patch, (340, 340), interpolation=cv2.INTER_NEAREST)
+        rgb = cv2.cvtColor(zoomed, cv2.COLOR_BGR2RGB)
+        # Crosshair in the middle
+        cv2.line(rgb, (170, 0), (170, 340), (255, 255, 0), 1)
+        cv2.line(rgb, (0, 170), (340, 170), (255, 255, 0), 1)
+        self.loupe_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.loupe_canvas.delete("all")
+        self.loupe_canvas.create_image(170, 170, image=self.loupe_photo)
+
+    # -------------------- remove preview + deep clean
+    def _preview_remove_result(self, new_image):
+        """Show a modal side-by-side; returns True if user hits Apply."""
+        top = tk.Toplevel(self.root)
+        top.title(t("Preview result"))
+        top.geometry("1200x720")
+        top.transient(self.root)
+        top.grab_set()
+
+        def _photo_of(img, maxw, maxh):
+            h, w = img.shape[:2]
+            s = min(maxw / w, maxh / h, 1.0)
+            nw, nh = max(1, int(w * s)), max(1, int(h * s))
+            rgb = cv2.cvtColor(cv2.resize(img, (nw, nh)), cv2.COLOR_BGR2RGB)
+            return ImageTk.PhotoImage(Image.fromarray(rgb))
+
+        body = tk.Frame(top)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        lf = tk.Frame(body)
+        lf.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+        rf = tk.Frame(body)
+        rf.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=4)
+        tk.Label(lf, text=t("Before"), font=("Arial", 11, "bold")).pack()
+        ll = tk.Label(lf)
+        ll.pack(fill=tk.BOTH, expand=True)
+        tk.Label(rf, text=t("After"), font=("Arial", 11, "bold")).pack()
+        rl = tk.Label(rf)
+        rl.pack(fill=tk.BOTH, expand=True)
+        top.update()
+        p1 = _photo_of(self.cv_image, 580, 620)
+        p2 = _photo_of(new_image, 580, 620)
+        ll.configure(image=p1)
+        rl.configure(image=p2)
+        ll.image = p1
+        rl.image = p2
+
+        decision = {"apply": False}
+
+        def _apply():
+            decision["apply"] = True
+            top.destroy()
+
+        def _cancel():
+            decision["apply"] = False
+            top.destroy()
+
+        bar = tk.Frame(top)
+        bar.pack(fill=tk.X, pady=6)
+        tk.Button(bar, text=t("Apply"), command=_apply, bg="lightgreen",
+                  font=("Arial", 11, "bold"), width=14).pack(side=tk.RIGHT, padx=8)
+        tk.Button(bar, text=t("Cancel"), command=_cancel, bg="lightgray",
+                  width=14).pack(side=tk.RIGHT, padx=4)
+        top.protocol("WM_DELETE_WINDOW", _cancel)
+        top.wait_window()
+        return decision["apply"]
+
+    def deep_clean(self, max_passes=3):
+        if self.cv_image is None:
+            messagebox.showerror(t("Error"), t("Please open an image first"))
+            return
+        # Either use existing selection OR seed from auto-detect.
+        if not self.rects and (self.extra_mask is None or self.extra_mask.max() == 0):
+            cands = auto_detect_regions(self.cv_image)
+            if not cands:
+                messagebox.showinfo(t("Info"), t("No watermarks detected"))
+                return
+            self.rects.extend(cands)
+            self._redraw_overlay()
+
+        for pass_idx in range(1, max_passes + 1):
+            self.log(t("Deep clean pass {}/{}").format(pass_idx, max_passes))
+            if not self.rects and (self.extra_mask is None or self.extra_mask.max() == 0):
+                self.log(t("Nothing detected after pass {}. Stopping.").format(pass_idx - 1))
+                break
+            if not self._remove_core(show_preview=False):
+                break
+            new_cands = auto_detect_regions(self.cv_image)
+            if not new_cands:
+                self.log(t("Nothing detected after pass {}. Stopping.").format(pass_idx))
+                break
+            self.rects.extend(new_cands)
+        self.display_image()
+        self._update_coord_text()
+
+    # -------------------- video
+    def open_video(self):
+        initial = CONFIG.get("last_dir") or None
+        fp = filedialog.askopenfilename(
+            initialdir=initial,
+            filetypes=[("Video", " ".join("*" + e for e in VIDEO_EXTS)),
+                       ("All files", "*.*")],
+        )
+        if not fp:
+            return
+        cap = cv2.VideoCapture(fp)
+        if not cap.isOpened():
+            messagebox.showerror(t("Error"), t("Cannot open video"))
+            return
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            messagebox.showerror(t("Error"), t("Cannot open video"))
+            return
+        self.cv_image = frame
+        self.original_image = frame.copy()
+        self.source_kind = "image"
+        self.source_path = fp
+        self.video_path = fp
+        self._file_desc = ("image", Path(fp).name + "  (video frame 0)")
+        self._reset_selection_state()
+        self._reset_undo()
+        self._refresh_file_text()
+        self.log(t("Opened: ") + Path(fp).name)
+        self.log(t("Size: {}x{}").format(frame.shape[1], frame.shape[0]))
+        self.reset_view()
+        self._remember(fp)
+
+    def process_video(self):
+        if not self.video_path:
+            messagebox.showwarning(t("Warning"), t("Open a video first via Video menu"))
+            return
+        if not self.rects and (self.extra_mask is None or self.extra_mask.max() == 0):
+            messagebox.showwarning(t("Warning"),
+                                   t("Draw at least one region first"))
+            return
+        out_path = filedialog.asksaveasfilename(
+            title=t("Export video to:"),
+            defaultextension=".mp4",
+            filetypes=[("MP4", "*.mp4"), ("AVI", "*.avi"), ("All", "*.*")],
+        )
+        if not out_path:
+            return
+
+        cap = cv2.VideoCapture(self.video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+        if not writer.isOpened():
+            cap.release()
+            messagebox.showerror(t("Error"), t("Cannot open video"))
+            return
+
+        # Build mask once (scales to each frame size in principle, but videos
+        # have constant dims so we reuse it).
+        h0, w0 = self.original_image.shape[:2]
+        rel_rects = [(x1 / w0, y1 / h0, x2 / w0, y2 / h0)
+                     for (x1, y1, x2, y2) in self.rects]
+        abs_rects = [(rx1 * w, ry1 * h, rx2 * w, ry2 * h)
+                     for rx1, ry1, rx2, ry2 in rel_rects]
+        extra = self._scale_mask_to(self.extra_mask, h0, w0, h, w) \
+            if self.extra_mask is not None else None
+        mask = self._build_combined_mask(h, w, rects=abs_rects, extra_mask=extra)
+        if mask.max() == 0:
+            cap.release()
+            writer.release()
+            messagebox.showerror(t("Error"), t("Selection is empty"))
+            return
+
+        self.progress.configure(mode="determinate",
+                                maximum=max(1, total), value=0)
+        self.process_btn.config(state="disabled")
+        self.batch_btn.config(state="disabled")
+        self.root.config(cursor="watch")
+        done = 0
+        try:
+            # Fast path: OpenCV Telea inpainting. Much faster than LaMa and
+            # good enough for typical static watermarks on video. Running
+            # LaMa per frame would take hours.
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                cleaned = cv2.inpaint(frame, mask, 3, cv2.INPAINT_TELEA)
+                writer.write(cleaned)
+                done += 1
+                if done % 10 == 0:
+                    self.progress["value"] = done
+                    self.log(t("Processing frame {}/{}").format(done, total))
+                    self.root.update()
+            self.progress["value"] = done
+            self.log(t("Video done. Output: {}").format(out_path))
+            messagebox.showinfo(t("Success"),
+                                t("Video done. Output: {}").format(out_path))
+        finally:
+            cap.release()
+            writer.release()
+            self._stop_progress()
+            self.process_btn.config(state="normal")
+            self.batch_btn.config(state="normal")
+            self.root.config(cursor="")
 
     # -------------------- closing
     def _on_close(self):
