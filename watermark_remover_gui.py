@@ -346,42 +346,117 @@ def replace_ooxml_images(path, replacements, extract_dir):
     shutil.rmtree(extract_dir)
 
 
-# --------------------------------------------- simple auto-detect
+# --------------------------------------------- auto-detect (MSER based)
+def _merge_overlapping_boxes(boxes, dx=15, dy=10):
+    """Merge boxes that are close or overlap after expanding by (dx, dy)."""
+    if not boxes:
+        return boxes
+    bs = [list(b) for b in boxes]
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(bs):
+            j = i + 1
+            while j < len(bs):
+                a, b = bs[i], bs[j]
+                ax1, ay1, ax2, ay2 = a[0] - dx, a[1] - dy, a[2] + dx, a[3] + dy
+                if not (b[2] < ax1 or b[0] > ax2 or b[3] < ay1 or b[1] > ay2):
+                    a[0] = min(a[0], b[0])
+                    a[1] = min(a[1], b[1])
+                    a[2] = max(a[2], b[2])
+                    a[3] = max(a[3], b[3])
+                    bs.pop(j)
+                    changed = True
+                else:
+                    j += 1
+            i += 1
+    return bs
+
+
 def auto_detect_regions(cv_img):
     """
-    Cheap heuristic to surface candidate watermark boxes.
-    Combines: text-like connected components + low-contrast overlay patches.
-    Not great, but beats clicking from scratch.
+    MSER-based candidate detector for watermarks.
+    Down-scales for speed, runs MSER on both polarities (dark- and
+    light-on-background text), merges stroke-level boxes into word-level
+    ones, then scores by corner proximity and size. Returns top 3.
     """
     if cv_img is None:
         return []
-    h, w = cv_img.shape[:2]
-    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    orig_h, orig_w = cv_img.shape[:2]
+    max_side = 1200
+    s = min(1.0, max_side / max(orig_h, orig_w))
+    small = cv2.resize(cv_img, (int(orig_w * s), int(orig_h * s))) if s < 1.0 else cv_img
+    h, w = small.shape[:2]
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
-    # Bright/pale overlays (common for translucent watermarks).
-    _, bright = cv2.threshold(blur, 200, 255, cv2.THRESH_BINARY)
+    try:
+        mser = cv2.MSER_create()
+        for attr, val in (("setDelta", 5),
+                          ("setMinArea", 40),
+                          ("setMaxArea", max(200, int(h * w * 0.01)))):
+            try:
+                getattr(mser, attr)(val)
+            except Exception:
+                pass
+        regions_a, _ = mser.detectRegions(gray)
+        regions_b, _ = mser.detectRegions(255 - gray)
+        all_regions = list(regions_a) + list(regions_b)
+    except Exception:
+        all_regions = []
 
-    # Edges to catch text strokes.
-    edges = cv2.Canny(blur, 40, 120)
-
-    combined = cv2.bitwise_or(bright, edges)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
-    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cands = []
-    img_area = h * w
-    for c in contours:
-        x, y, cw, ch = cv2.boundingRect(c)
-        area = cw * ch
-        if area < 200 or area > img_area * 0.3:
+    raw = []
+    for region in all_regions:
+        x, y, rw, rh = cv2.boundingRect(region.reshape(-1, 1, 2))
+        if rw < 6 or rh < 6:
             continue
-        if cw < 20 or ch < 8:
+        if rw > w * 0.6 or rh > h * 0.6:
             continue
-        cands.append((x, y, x + cw, y + ch, area))
-    cands.sort(key=lambda r: r[4], reverse=True)
-    return [(x1, y1, x2, y2) for (x1, y1, x2, y2, _) in cands[:8]]
+        raw.append([x, y, x + rw, y + rh])
+
+    merged = _merge_overlapping_boxes(
+        raw, dx=max(6, int(w * 0.02)), dy=max(4, int(h * 0.015)))
+
+    scored = []
+    for (x1, y1, x2, y2) in merged:
+        bw = x2 - x1
+        bh = y2 - y1
+        area = bw * bh
+        if area < 400 or area > w * h * 0.25:
+            continue
+        if bw < 20 and bh < 20:
+            continue
+        ratio = bw / max(1, bh)
+        if ratio > 40 or ratio < 0.04:
+            continue
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        # Distance to nearest image corner (watermarks usually sit near edges).
+        d_corner = min(
+            (cx ** 2 + cy ** 2) ** 0.5,
+            ((w - cx) ** 2 + cy ** 2) ** 0.5,
+            (cx ** 2 + (h - cy) ** 2) ** 0.5,
+            ((w - cx) ** 2 + (h - cy) ** 2) ** 0.5,
+        )
+        corner_score = 1.0 - min(1.0, d_corner / (min(h, w) / 2.0 + 1e-6))
+        size_score = min(1.0, area / (w * h * 0.03))
+        score = corner_score * 2.5 + size_score * 0.5
+        scored.append((score, x1, y1, x2, y2))
+
+    scored.sort(reverse=True)
+    inv = 1.0 / s if s < 1.0 else 1.0
+    out = []
+    for _, x1, y1, x2, y2 in scored[:3]:
+        # Give the box a small margin so feathering/inpaint has room.
+        pad_x = max(2, int((x2 - x1) * 0.05))
+        pad_y = max(2, int((y2 - y1) * 0.05))
+        out.append((
+            int(max(0, (x1 - pad_x) * inv)),
+            int(max(0, (y1 - pad_y) * inv)),
+            int(min(orig_w, (x2 + pad_x) * inv)),
+            int(min(orig_h, (y2 + pad_y) * inv)),
+        ))
+    return out
 
 
 # --------------------------------------------- main class
@@ -530,7 +605,7 @@ class WatermarkRemover:
             text=t("Preview - drag to box, Shift+drag/middle-drag to pan, wheel to zoom"),
             font=("Arial", 11, "bold"),
         ).pack()
-        self.canvas = tk.Canvas(left, bg="gray", cursor="crosshair")
+        self.canvas = tk.Canvas(left, bg="gray", cursor="tcross")
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
         right = tk.Frame(main_frame, width=340)
@@ -637,6 +712,8 @@ class WatermarkRemover:
         self.canvas.bind("<MouseWheel>", self.on_wheel)
         self.canvas.bind("<Button-4>", lambda e: self._zoom_around(e.x, e.y, 1.1))
         self.canvas.bind("<Button-5>", lambda e: self._zoom_around(e.x, e.y, 1 / 1.1))
+        self.canvas.bind("<Motion>", self._on_cursor_motion)
+        self.canvas.bind("<Leave>", lambda e: self.canvas.delete("cursor"))
 
         self.root.bind("<Escape>", lambda e: self.clear_selection())
         self.root.bind("<Control-z>", lambda e: self.undo())
@@ -1175,12 +1252,31 @@ class WatermarkRemover:
         self.display_image()
         self._update_coord_text()
 
+    def _on_cursor_motion(self, event):
+        self.canvas.delete("cursor")
+        if self.cv_image is None or self.panning:
+            return
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        # High-contrast crosshair so users always see the exact pointer
+        # position even over a busy image.
+        self.canvas.create_line(0, event.y, cw, event.y,
+                                fill="yellow", dash=(3, 3), tags="cursor")
+        self.canvas.create_line(event.x, 0, event.x, ch,
+                                fill="yellow", dash=(3, 3), tags="cursor")
+        if self.tool_mode.get() == "brush":
+            r = max(1, int(self.brush_size.get())) * self.base_scale * self.zoom
+            self.canvas.create_oval(
+                event.x - r, event.y - r, event.x + r, event.y + r,
+                outline="yellow", width=1, tags="cursor")
+
     def on_pan_start(self, event):
         if self.cv_image is None:
             return
         self.panning = True
         self.pan_anchor = (event.x, event.y, self.pan_x, self.pan_y)
         self.canvas.config(cursor="fleur")
+        self.canvas.delete("cursor")
 
     def on_pan_move(self, event):
         if not self.panning or not self.pan_anchor:
@@ -1193,7 +1289,7 @@ class WatermarkRemover:
     def on_pan_end(self, event):
         self.panning = False
         self.pan_anchor = None
-        self.canvas.config(cursor="crosshair")
+        self.canvas.config(cursor="tcross")
 
     # -------------------- brush / color / poly helpers
     def _ensure_extra_mask(self):
