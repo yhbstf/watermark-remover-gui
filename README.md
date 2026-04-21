@@ -1,5 +1,8 @@
 # Watermark Remover GUI
 
+[![Build and Release](https://github.com/yhbstf/watermark-remover-gui/actions/workflows/release.yml/badge.svg)](https://github.com/yhbstf/watermark-remover-gui/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 A Tkinter desktop tool that removes watermarks from images — including images embedded in Word `.docx` files — using the [IOPaint](https://github.com/Sanster/IOPaint) LaMa inpainting model.
 
 ## Features
