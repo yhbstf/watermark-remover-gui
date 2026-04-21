@@ -10,22 +10,32 @@ A Tkinter desktop tool that removes watermarks from images — including images 
 - **Batch across Word**: draw regions once, then apply the *same relative regions* to every image in the `.docx` in one click.
 - Save the result back into the original Word document (a `.backup` is created automatically), or export PNG/JPG.
 
-## Requirements
+## Download (click-to-run)
+
+Pre-built binaries are published on the [Releases](https://github.com/yhbstf/watermark-remover-gui/releases) page:
+
+- **Windows (x64)** — `watermark-remover-gui-windows-x64.zip`: extract, run `watermark-remover-gui.exe` inside the folder.
+- **Linux (x64)** — `watermark-remover-gui-linux-x64.tar.gz`: extract, run `./watermark-remover-gui` inside the folder.
+- **macOS (Apple Silicon)** — `watermark-remover-gui-macos-arm64.zip`: extract, right-click `watermark-remover-gui.app` → **Open** (first launch only — macOS Gatekeeper warns about unsigned apps).
+
+The first time you click **Remove Watermark**, `iopaint` downloads LaMa weights (~200 MB) to the user cache. Subsequent runs are offline.
+
+## Run from source
+
+### Requirements
 
 - Python 3.9+
-- Windows / macOS / Linux (developed on Windows 11)
+- Windows / macOS / Linux
 - Dependencies in `requirements.txt`:
-  - `opencv-python`, `numpy`, `pillow`, `python-docx`, `iopaint`
+  - `opencv-python`, `numpy`, `pillow`, `python-docx`, `iopaint` (pulls in `torch`)
 
-The first time you run the inpainting step, `iopaint` will download the LaMa model weights (~200 MB). A CUDA GPU is used automatically if available; CPU works too.
-
-## Install
+### Install
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Run
+### Run
 
 ```bash
 python watermark_remover_gui.py

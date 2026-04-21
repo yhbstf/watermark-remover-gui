@@ -528,13 +528,24 @@ class WatermarkRemover:
         out_dir.mkdir(parents=True)
         cv2.imwrite(str(img_path), img_bgr)
         cv2.imwrite(str(mask_path), mask)
+        # In frozen builds `sys.executable -m iopaint` doesn't work (the exe
+        # is us, not python), so self-invoke with the worker sentinel and let
+        # the __main__ dispatcher re-enter as iopaint's CLI.
+        if getattr(sys, 'frozen', False):
+            cmd = [sys.executable, '--iopaint-worker', 'run',
+                   '--model', 'lama',
+                   '--image', str(img_path),
+                   '--mask', str(mask_path),
+                   '--output', str(out_dir)]
+        else:
+            cmd = [sys.executable, '-m', 'iopaint', 'run',
+                   '--model', 'lama',
+                   '--image', str(img_path),
+                   '--mask', str(mask_path),
+                   '--output', str(out_dir)]
         subprocess.run(
-            [sys.executable, '-m', 'iopaint', 'run',
-             '--model', 'lama',
-             '--image', str(img_path),
-             '--mask', str(mask_path),
-             '--output', str(out_dir)],
-            check=True, capture_output=True, timeout=300, text=True,
+            cmd,
+            check=True, capture_output=True, timeout=600, text=True,
             encoding='utf-8', errors='replace',
         )
         result = cv2.imread(str(out_dir / "input.png"))
@@ -755,6 +766,16 @@ class WatermarkRemover:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--iopaint-worker":
+        # Frozen builds re-enter the exe here to act as iopaint's CLI.
+        from iopaint import entry_point
+        sys.argv = ["iopaint"] + sys.argv[2:]
+        entry_point()
+        sys.exit(0)
+
     root = tk.Tk()
     app = WatermarkRemover(root)
     root.mainloop()
