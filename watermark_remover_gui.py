@@ -142,8 +142,8 @@ _ZH = {
     "Detect text (OCR)": "检测文字水印 (OCR)",
     "Select by color...": "按颜色选择...",
 
-    "Preview - drag to box, Shift+drag/middle-drag to pan, wheel to zoom":
-        "预览 — 拖拽画框，Shift+拖 / 中键拖 平移，滚轮缩放",
+    "Preview - drag to box, Shift+drag/middle-drag pan, wheel zoom, Space=compare":
+        "预览 — 拖拽画框，Shift+拖 / 中键拖 平移，滚轮缩放，按住空格对比上一步",
     "Control Panel": "控制面板",
     "Current file:": "当前文件：",
     "Regions:": "选区：",
@@ -189,6 +189,7 @@ _ZH = {
     "4. Save to Word / Export PNG\n"
     "Wheel = zoom at cursor\n"
     "Shift+drag or middle-drag = pan\n"
+    "Hold Space = compare with previous step\n"
     "+/-/0 = zoom in/out/fit, Esc = clear, Ctrl+Z/Y = undo/redo":
         "就绪。\n"
         "1. 文件 → 打开图片 / 从 Word 打开\n"
@@ -197,6 +198,7 @@ _ZH = {
         "4. 保存到 Word / 导出 PNG\n"
         "滚轮：以鼠标为中心缩放\n"
         "Shift+拖 或 中键拖：平移\n"
+        "按住空格：对比上一步\n"
         "+/-/0：放大/缩小/适应，Esc：清空，Ctrl+Z/Y：撤销/重做",
 
     "Opened: ": "已打开：",
@@ -314,15 +316,14 @@ _ZH = {
     "Template applied": "模板已应用",
     "Preview result": "预览结果",
     "Apply": "应用",
-    "Deep Clean": "深度清理",
     "Show Loupe (L)": "显示放大镜 (L)",
     "Loupe": "放大镜",
     "Hotkeys: R rect / B brush / P polygon / C color / L loupe / Del delete region":
         "快捷键: R 矩形 / B 画笔 / P 多边形 / C 颜色 / L 放大镜 / Del 删除选区",
-    "Nothing detected after pass {}. Stopping.": "第 {} 轮后未检测到残留，停止。",
-    "Deep clean pass {}/{}": "深度清理：第 {}/{} 轮",
     "Selected region #{}": "已选中选区 #{}",
     "Deleted region": "已删除选区",
+    "Done. (Hold Space to compare with original; Ctrl+Z to undo.)":
+        "完成。（按住空格对比原图，Ctrl+Z 撤销。）",
 }
 
 
@@ -565,6 +566,10 @@ class WatermarkRemover:
         # Video source state.
         self.video_path = None
 
+        # Hold-space comparison: while True, canvas shows the most recent
+        # undo snapshot instead of cv_image, for before/after comparison.
+        self.comparing = False
+
         self._build_menu()
         self._build_layout()
         self._bind_events()
@@ -579,6 +584,7 @@ class WatermarkRemover:
             "4. Save to Word / Export PNG\n"
             "Wheel = zoom at cursor\n"
             "Shift+drag or middle-drag = pan\n"
+            "Hold Space = compare with previous step\n"
             "+/-/0 = zoom in/out/fit, Esc = clear, Ctrl+Z/Y = undo/redo"
         ))
         if not HAVE_DND:
@@ -621,7 +627,6 @@ class WatermarkRemover:
         tools_menu.add_command(label=t("Detect text (OCR)"), command=self.ocr_detect)
         tools_menu.add_command(label=t("Select by color..."), command=self.begin_color_pick)
         tools_menu.add_separator()
-        tools_menu.add_command(label=t("Deep Clean"), command=self.deep_clean)
         tools_menu.add_command(label=t("Show Loupe (L)"), command=self.toggle_loupe)
         tools_menu.add_command(label=t("Compare (before/after)"),
                                command=self.show_compare)
@@ -670,9 +675,10 @@ class WatermarkRemover:
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tk.Label(
             left,
-            text=t("Preview - drag to box, Shift+drag/middle-drag to pan, wheel to zoom"),
+            text=t("Preview - drag to box, Shift+drag/middle-drag pan, wheel zoom, Space=compare"),
             font=("Arial", 11, "bold"),
         ).pack()
+
         self.canvas = tk.Canvas(left, bg="gray", cursor="tcross")
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
@@ -736,8 +742,6 @@ class WatermarkRemover:
                                      command=self.remove_watermark, bg="lightgreen",
                                      font=("Arial", 11, "bold"))
         self.process_btn.pack(fill=tk.X, pady=4)
-        tk.Button(btn_frame, text=t("Deep Clean"),
-                  command=self.deep_clean, bg="#aed581").pack(fill=tk.X, pady=2)
         self.batch_btn = tk.Button(btn_frame, text=t("Batch: Apply to ALL Word Images"),
                                    command=self.batch_remove_doc, bg="#c5e1a5",
                                    font=("Arial", 10, "bold"))
@@ -808,6 +812,8 @@ class WatermarkRemover:
         self.root.bind("<Key-L>", lambda e: self.toggle_loupe())
         self.root.bind("<Delete>", lambda e: self._delete_selected_rect())
         self.root.bind("<BackSpace>", lambda e: self._delete_selected_rect())
+        self.root.bind("<KeyPress-space>", self._on_compare_down)
+        self.root.bind("<KeyRelease-space>", self._on_compare_up)
 
     def _setup_dnd(self):
         if not HAVE_DND:
@@ -1058,70 +1064,198 @@ class WatermarkRemover:
     def _show_image_selector(self, images_info, source):
         selector = tk.Toplevel(self.root)
         selector.title(t("Select Image"))
-        selector.geometry("720x520")
+        selector.geometry("1320x820")
+        selector.minsize(960, 600)
+
         tk.Label(selector, text=t("Select image to edit:"),
-                 font=("Arial", 11, "bold")).pack(pady=10)
+                 font=("Arial", 11, "bold")).pack(pady=8)
 
         main_frame = tk.Frame(selector)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        list_frame = tk.Frame(main_frame)
-        list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tk.Label(list_frame, text=t("Images:"), font=("Arial", 10, "bold")).pack(anchor="w")
-        frame = tk.Frame(list_frame)
-        frame.pack(fill=tk.BOTH, expand=True)
-        scrollbar = tk.Scrollbar(frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        listbox = tk.Listbox(frame, yscrollcommand=scrollbar.set, height=12)
-        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=listbox.yview)
-        for info in images_info:
-            listbox.insert(tk.END, "{} ({:.2f} MB)".format(
-                info["name"], info["size"] / 1024 / 1024))
+        # ---- left: scrollable thumbnail grid (fixed column width)
+        cols = 3
+        thumb_size = 150
+        cell_w = 172
+        cell_h = 214
+        left_width = cols * cell_w + 32
 
-        preview_frame = tk.Frame(main_frame, width=280, bg="gray")
-        preview_frame.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(10, 0))
-        tk.Label(preview_frame, text=t("Preview:"),
-                 font=("Arial", 10, "bold"), bg="gray", fg="white").pack()
-        preview_canvas = tk.Canvas(preview_frame, bg="gray", width=260, height=360)
+        left = tk.Frame(main_frame, width=left_width)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        left.pack_propagate(False)
+        tk.Label(left,
+                 text="{} ({})".format(t("Images:"), len(images_info)),
+                 font=("Arial", 10, "bold")).pack(anchor="w")
+
+        grid_wrap = tk.Frame(left)
+        grid_wrap.pack(fill=tk.BOTH, expand=True)
+        grid_canvas = tk.Canvas(grid_wrap, bg="#222",
+                                highlightthickness=0, width=cols * cell_w)
+        grid_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        gsb = tk.Scrollbar(grid_wrap, orient=tk.VERTICAL, command=grid_canvas.yview)
+        gsb.pack(side=tk.RIGHT, fill=tk.Y)
+        grid_canvas.configure(yscrollcommand=gsb.set)
+        inner = tk.Frame(grid_canvas, bg="#222")
+        grid_canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        # ---- right: big preview + info
+        right = tk.Frame(main_frame)
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
+        info_label = tk.Label(right, text="", font=("Arial", 11, "bold"),
+                              anchor="w", justify=tk.LEFT)
+        info_label.pack(anchor="w", padx=5, pady=(0, 5))
+        preview_canvas = tk.Canvas(right, bg="gray", highlightthickness=0)
         preview_canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        def _preview(_=None):
-            sel = listbox.curselection()
-            if not sel:
-                return
-            info = images_info[sel[0]]
+        # Decode all images once — small thumbs + keep full-res for preview.
+        decoded = []
+        thumb_refs = []
+        for info in images_info:
             nparr = np.frombuffer(info["data"], np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             if img is None:
+                decoded.append(None)
+                continue
+            ih, iw = img.shape[:2]
+            s = min(thumb_size / iw, thumb_size / ih, 1.0)
+            tw, th = max(1, int(iw * s)), max(1, int(ih * s))
+            rgb = cv2.cvtColor(cv2.resize(img, (tw, th)), cv2.COLOR_BGR2RGB)
+            thumb = ImageTk.PhotoImage(Image.fromarray(rgb))
+            thumb_refs.append(thumb)
+            decoded.append({"img": img, "w": iw, "h": ih, "thumb": thumb})
+
+        selection = {"idx": None}
+        cells = []
+
+        def _redraw_highlights():
+            for i, cell in enumerate(cells):
+                if i == selection["idx"]:
+                    cell.configure(bg="#4a90e2", highlightbackground="#4a90e2",
+                                   highlightthickness=2)
+                    for child in cell.winfo_children():
+                        child.configure(bg="#4a90e2")
+                else:
+                    cell.configure(bg="#222", highlightthickness=0)
+                    for child in cell.winfo_children():
+                        child.configure(bg="#222")
+
+        preview_state = {
+            "zoom": 1.0,
+            "pan_x": 0.0,
+            "pan_y": 0.0,
+            "base_scale": 1.0,
+            "panning": False,
+            "pan_anchor": None,
+        }
+
+        def _render_preview(fit=False):
+            idx = selection["idx"]
+            if idx is None:
                 return
-            h, w = img.shape[:2]
-            s = min(260 / w, 360 / h, 1.0)
-            nw, nh = max(1, int(w * s)), max(1, int(h * s))
-            rgb = cv2.cvtColor(cv2.resize(img, (nw, nh)), cv2.COLOR_BGR2RGB)
+            d = decoded[idx]
+            if d is None:
+                info_label.configure(text="(decode failed)")
+                preview_canvas.delete("all")
+                return
+            info = images_info[idx]
+            info_label.configure(text="#{}  {}\n{}x{}   {:.2f} MB".format(
+                idx + 1, info["name"], d["w"], d["h"],
+                info["size"] / 1024 / 1024))
+            preview_canvas.update_idletasks()
+            cw = preview_canvas.winfo_width()
+            ch = preview_canvas.winfo_height()
+            if cw < 100 or ch < 100:
+                cw, ch = 700, 600
+            base = min(cw / d["w"], ch / d["h"], 1.0)
+            preview_state["base_scale"] = base
+            if fit:
+                preview_state["zoom"] = 1.0
+                eff = base * preview_state["zoom"]
+                preview_state["pan_x"] = (cw - d["w"] * eff) / 2
+                preview_state["pan_y"] = (ch - d["h"] * eff) / 2
+            eff = base * preview_state["zoom"]
+            nw = max(1, int(d["w"] * eff))
+            nh = max(1, int(d["h"] * eff))
+            if nw * nh > 40_000_000:
+                cap = (40_000_000 / (nw * nh)) ** 0.5
+                nw = max(1, int(nw * cap))
+                nh = max(1, int(nh * cap))
+            rgb = cv2.cvtColor(cv2.resize(d["img"], (nw, nh)), cv2.COLOR_BGR2RGB)
             photo = ImageTk.PhotoImage(Image.fromarray(rgb))
             preview_canvas.delete("all")
-            preview_canvas.create_image(130, 180, image=photo)
+            preview_canvas.create_image(preview_state["pan_x"],
+                                        preview_state["pan_y"],
+                                        anchor=tk.NW, image=photo)
             preview_canvas.image = photo
 
-        listbox.bind("<<ListboxSelect>>", _preview)
-        if images_info:
-            listbox.selection_set(0)
-            _preview()
+        def _select(idx):
+            selection["idx"] = idx
+            _redraw_highlights()
+            _render_preview(fit=True)
+
+        def _preview_wheel(event):
+            if selection["idx"] is None:
+                return
+            d = decoded[selection["idx"]]
+            if d is None:
+                return
+            factor = 1.1 if event.delta > 0 else (1 / 1.1)
+            old_zoom = preview_state["zoom"]
+            new_zoom = max(0.1, min(20.0, old_zoom * factor))
+            if abs(new_zoom - old_zoom) < 1e-6:
+                return
+            base = preview_state["base_scale"]
+            eff_old = base * old_zoom
+            ix = (event.x - preview_state["pan_x"]) / max(eff_old, 1e-6)
+            iy = (event.y - preview_state["pan_y"]) / max(eff_old, 1e-6)
+            preview_state["zoom"] = new_zoom
+            eff_new = base * new_zoom
+            preview_state["pan_x"] = event.x - ix * eff_new
+            preview_state["pan_y"] = event.y - iy * eff_new
+            _render_preview()
+
+        def _preview_pan_start(event):
+            preview_state["panning"] = True
+            preview_state["pan_anchor"] = (event.x, event.y,
+                                            preview_state["pan_x"],
+                                            preview_state["pan_y"])
+            preview_canvas.config(cursor="fleur")
+
+        def _preview_pan_move(event):
+            if not preview_state["panning"] or not preview_state["pan_anchor"]:
+                return
+            ex0, ey0, px0, py0 = preview_state["pan_anchor"]
+            preview_state["pan_x"] = px0 + (event.x - ex0)
+            preview_state["pan_y"] = py0 + (event.y - ey0)
+            _render_preview()
+
+        def _preview_pan_end(event):
+            preview_state["panning"] = False
+            preview_state["pan_anchor"] = None
+            preview_canvas.config(cursor="")
+
+        preview_canvas.bind("<MouseWheel>", _preview_wheel)
+        preview_canvas.bind("<Button-1>", _preview_pan_start)
+        preview_canvas.bind("<B1-Motion>", _preview_pan_move)
+        preview_canvas.bind("<ButtonRelease-1>", _preview_pan_end)
+        preview_canvas.bind("<Button-2>", _preview_pan_start)
+        preview_canvas.bind("<B2-Motion>", _preview_pan_move)
+        preview_canvas.bind("<ButtonRelease-2>", _preview_pan_end)
+        preview_canvas.bind("<Double-Button-1>",
+                            lambda e: _render_preview(fit=True))
 
         def _confirm():
-            sel = listbox.curselection()
-            if not sel:
+            idx = selection["idx"]
+            if idx is None:
                 messagebox.showwarning(t("Warning"), t("Please select an image"))
                 return
-            info = images_info[sel[0]]
-            nparr = np.frombuffer(info["data"], np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is None:
+            d = decoded[idx]
+            if d is None:
                 messagebox.showerror(t("Error"), t("Cannot decode image"))
                 return
-            self.cv_image = img
-            self.original_image = img.copy()
+            info = images_info[idx]
+            self.cv_image = d["img"]
+            self.original_image = d["img"].copy()
             if source == "pdf":
                 self.source_extra = info["xref"]
                 kind_label = "PDF"
@@ -1133,12 +1267,105 @@ class WatermarkRemover:
             self._reset_undo()
             self._refresh_file_text()
             self.log(t("Loaded: ") + info["name"])
-            self.log(t("Size: {}x{}").format(img.shape[1], img.shape[0]))
+            self.log(t("Size: {}x{}").format(d["w"], d["h"]))
             self.reset_view()
             selector.destroy()
 
-        tk.Button(selector, text=t("Confirm"), command=_confirm,
-                  bg="lightgreen", font=("Arial", 11)).pack(pady=10)
+        # Build cells
+        for i, info in enumerate(images_info):
+            r, c = i // cols, i % cols
+            cell = tk.Frame(inner, bg="#222", width=cell_w, height=cell_h,
+                            highlightthickness=0, bd=0)
+            cell.grid(row=r, column=c, padx=3, pady=3)
+            cell.grid_propagate(False)
+            cells.append(cell)
+            d = decoded[i]
+            if d is not None:
+                img_label = tk.Label(cell, image=d["thumb"], bg="#222")
+            else:
+                img_label = tk.Label(cell, text="(no preview)", bg="#222",
+                                     fg="white", width=18, height=8)
+            img_label.place(relx=0.5, y=80, anchor="center")
+            short_name = info["name"]
+            if len(short_name) > 22:
+                short_name = short_name[:19] + "..."
+            txt = "#{}  {}".format(i + 1, short_name)
+            name_label = tk.Label(cell, text=txt, bg="#222", fg="white",
+                                  font=("Arial", 8))
+            name_label.place(relx=0.5, y=170, anchor="center")
+            dim_txt = "{}x{}  {:.1f}MB".format(
+                d["w"], d["h"], info["size"] / 1024 / 1024) if d else ""
+            dim_label = tk.Label(cell, text=dim_txt, bg="#222", fg="#aaa",
+                                 font=("Arial", 8))
+            dim_label.place(relx=0.5, y=192, anchor="center")
+
+            def _click(e, idx=i):
+                _select(idx)
+
+            def _dblclick(e, idx=i):
+                _select(idx)
+                _confirm()
+
+            for w in (cell, img_label, name_label, dim_label):
+                w.bind("<Button-1>", _click)
+                w.bind("<Double-Button-1>", _dblclick)
+
+        inner.update_idletasks()
+        grid_canvas.configure(scrollregion=grid_canvas.bbox("all"))
+
+        def _on_wheel(event):
+            grid_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+        grid_canvas.bind("<Enter>",
+                         lambda e: grid_canvas.bind_all("<MouseWheel>", _on_wheel))
+        grid_canvas.bind("<Leave>",
+                         lambda e: grid_canvas.unbind_all("<MouseWheel>"))
+
+        preview_canvas.bind("<Configure>",
+                            lambda e: _render_preview())
+
+        def _nav(delta):
+            if not cells:
+                return
+            idx = selection["idx"] or 0
+            idx = max(0, min(len(cells) - 1, idx + delta))
+            _select(idx)
+            # scroll grid so selected cell is visible
+            r = idx // cols
+            row_y = r * (cell_h + 6)
+            bbox = grid_canvas.bbox("all")
+            if bbox:
+                total_h = bbox[3]
+                if total_h:
+                    grid_canvas.yview_moveto(max(0, row_y - 40) / max(1, total_h))
+
+        selector.bind("<Return>", lambda e: _confirm())
+        selector.bind("<Up>", lambda e: _nav(-cols))
+        selector.bind("<Down>", lambda e: _nav(cols))
+        selector.bind("<Left>", lambda e: _nav(-1))
+        selector.bind("<Right>", lambda e: _nav(1))
+        selector.bind("<Escape>", lambda e: selector.destroy())
+
+        def _cleanup():
+            try:
+                grid_canvas.unbind_all("<MouseWheel>")
+            except Exception:
+                pass
+            selector.destroy()
+
+        selector.protocol("WM_DELETE_WINDOW", _cleanup)
+
+        if images_info:
+            _select(0)
+
+        btn_bar = tk.Frame(selector)
+        btn_bar.pack(fill=tk.X, pady=6)
+        tk.Button(btn_bar, text=t("Cancel"), command=_cleanup,
+                  bg="lightgray", width=14).pack(side=tk.RIGHT, padx=4)
+        tk.Button(btn_bar, text=t("Confirm"), command=_confirm,
+                  bg="lightgreen", font=("Arial", 11, "bold"),
+                  width=14).pack(side=tk.RIGHT, padx=10)
+        selector.focus_set()
 
     # -------------------- view
     def reset_view(self):
@@ -1189,11 +1416,16 @@ class WatermarkRemover:
     def display_image(self):
         if self.cv_image is None:
             return
+        shown = self.cv_image
+        if self.comparing and self.undo_stack:
+            prev = self.undo_stack[-1][0]
+            if prev is not None:
+                shown = prev
         canvas_w = self.canvas.winfo_width()
         canvas_h = self.canvas.winfo_height()
         if canvas_w < 50 or canvas_h < 50:
             canvas_w, canvas_h = 800, 600
-        h, w = self.cv_image.shape[:2]
+        h, w = shown.shape[:2]
         self.base_scale = min(canvas_w / w, canvas_h / h, 1.0)
         eff = self.base_scale * self.zoom
         nw = max(1, int(w * eff))
@@ -1202,8 +1434,8 @@ class WatermarkRemover:
             cap = (40_000_000 / (nw * nh)) ** 0.5
             nw = max(1, int(nw * cap))
             nh = max(1, int(nh * cap))
-        rgb = cv2.cvtColor(self.cv_image, cv2.COLOR_BGR2RGB)
-        # Overlay extra_mask in translucent red before scaling.
+        rgb = cv2.cvtColor(shown, cv2.COLOR_BGR2RGB)
+        # Overlay extra_mask in translucent red.
         if self.extra_mask is not None and self.extra_mask.max() > 0:
             overlay = rgb.copy()
             red = np.zeros_like(rgb)
@@ -1282,6 +1514,7 @@ class WatermarkRemover:
         if self.selected_rect_idx is None:
             return
         if 0 <= self.selected_rect_idx < len(self.rects):
+            self._push_undo()
             self.rects.pop(self.selected_rect_idx)
             self.selected_rect_idx = None
             self._redraw_overlay()
@@ -1305,6 +1538,7 @@ class WatermarkRemover:
             # If we click inside an existing rect, select it and start a move.
             hit = self._rect_hit_test(ix, iy)
             if hit is not None:
+                self._push_undo()
                 self.selected_rect_idx = hit
                 self.rect_drag = (tuple(self.rects[hit]), ix, iy)
                 self.drawing = True
@@ -1318,6 +1552,7 @@ class WatermarkRemover:
             self.drawing = True
             self._redraw_overlay()
         elif mode == "brush":
+            self._push_undo()
             self._ensure_extra_mask()
             self.drawing = True
             self._paint_brush(ix, iy)
@@ -1373,6 +1608,7 @@ class WatermarkRemover:
                 x1, x2 = min(x1, x2), max(x1, x2)
                 y1, y2 = min(y1, y2), max(y1, y2)
                 if (x2 - x1) >= 2 and (y2 - y1) >= 2:
+                    self._push_undo()
                     self.rects.append((x1, y1, x2, y2))
                 self.in_progress = None
                 self._redraw_overlay()
@@ -1385,6 +1621,7 @@ class WatermarkRemover:
     def finalize_polygon(self):
         if self.tool_mode.get() != "polygon" or len(self.polygon_points) < 3:
             return
+        self._push_undo()
         self._ensure_extra_mask()
         pts = np.array([[int(x), int(y)] for x, y in self.polygon_points], dtype=np.int32)
         cv2.fillPoly(self.extra_mask, [pts], 255)
@@ -1464,6 +1701,7 @@ class WatermarkRemover:
         tol = int(self.color_tol.get())
         diff = np.abs(self.cv_image.astype(np.int16) - target).max(axis=2)
         sel = (diff <= tol).astype(np.uint8) * 255
+        self._push_undo()
         self._ensure_extra_mask()
         self.extra_mask = cv2.bitwise_or(self.extra_mask, sel)
         self._color_pick_pending = False
@@ -1473,12 +1711,17 @@ class WatermarkRemover:
     # -------------------- selection utilities
     def undo_last_region(self):
         if self.rects:
+            self._push_undo()
             self.rects.pop()
             self._redraw_overlay()
             self._update_coord_text()
             self.log(t("Removed last region"))
 
     def clear_selection(self):
+        if (self.rects or self.in_progress or
+                (self.extra_mask is not None and self.extra_mask.max() > 0) or
+                self.polygon_points):
+            self._push_undo()
         self.rects = []
         self.in_progress = None
         self.drawing = False
@@ -1635,20 +1878,17 @@ class WatermarkRemover:
             pass
 
     def remove_watermark(self):
-        self._remove_core(show_preview=True, show_success=True)
-
-    def _remove_core(self, show_preview=True, show_success=False):
         if self.cv_image is None:
             messagebox.showerror(t("Error"), t("Please open an image first"))
-            return False
+            return
         if not self.rects and (self.extra_mask is None or self.extra_mask.max() == 0):
             messagebox.showerror(t("Error"), t("Draw at least one region first"))
-            return False
+            return
         h, w = self.cv_image.shape[:2]
         mask = self._build_combined_mask(h, w)
         if mask.max() == 0:
             messagebox.showerror(t("Error"), t("Selection is empty"))
-            return False
+            return
         self.log(t("Removing watermark..."))
         self.process_btn.config(state="disabled")
         self.batch_btn.config(state="disabled")
@@ -1661,38 +1901,22 @@ class WatermarkRemover:
             err = (e.stderr or e.stdout or "")[-800:]
             self.log(t("iopaint failed:\n") + err)
             messagebox.showerror(t("Error"), t("iopaint failed:\n") + err)
-            self._stop_progress()
-            self.process_btn.config(state="normal")
-            self.batch_btn.config(state="normal")
-            self.root.config(cursor="")
-            return False
+            return
         except subprocess.TimeoutExpired:
             self.log(t("iopaint timed out (>10min)"))
             messagebox.showerror(t("Error"), t("iopaint timed out (>10min)"))
-            self._stop_progress()
-            self.process_btn.config(state="normal")
-            self.batch_btn.config(state="normal")
-            self.root.config(cursor="")
-            return False
+            return
         except Exception as e:
             self.log(t("Failed: ") + str(e))
             messagebox.showerror(t("Error"), t("Failed: ") + str(e))
+            return
+        finally:
             self._stop_progress()
             self.process_btn.config(state="normal")
             self.batch_btn.config(state="normal")
             self.root.config(cursor="")
-            return False
 
-        self._stop_progress()
-        self.process_btn.config(state="normal")
-        self.batch_btn.config(state="normal")
-        self.root.config(cursor="")
-
-        if show_preview:
-            if not self._preview_remove_result(result):
-                self.log(t("Cancel"))
-                return False
-
+        # Commit directly; undo stack holds the previous state for Ctrl+Z.
         self._push_undo()
         self.cv_image = result
         self.rects = []
@@ -1702,10 +1926,7 @@ class WatermarkRemover:
         self.selected_rect_idx = None
         self._update_coord_text()
         self.display_image()
-        self.log(t("Done."))
-        if show_success:
-            messagebox.showinfo(t("Success"), t("Watermark removed"))
-        return True
+        self.log(t("Done. (Hold Space to compare with original; Ctrl+Z to undo.)"))
 
     # -------------------- batch modes
     def batch_remove_doc(self):
@@ -1994,6 +2215,7 @@ class WatermarkRemover:
             self.log(t("No watermarks detected"))
             messagebox.showinfo(t("Info"), t("No watermarks detected"))
             return
+        self._push_undo()
         self.rects.extend(cands)
         self._redraw_overlay()
         self._update_coord_text()
@@ -2013,7 +2235,7 @@ class WatermarkRemover:
         except Exception as e:
             messagebox.showerror(t("Error"), t("Failed: ") + str(e))
             return
-        added = 0
+        new_boxes = []
         for i in range(len(data.get("text", []))):
             txt = (data["text"][i] or "").strip()
             try:
@@ -2026,14 +2248,15 @@ class WatermarkRemover:
                 w = data["width"][i]
                 h = data["height"][i]
                 if w > 4 and h > 4:
-                    self.rects.append((x, y, x + w, y + h))
-                    added += 1
-        if added == 0:
+                    new_boxes.append((x, y, x + w, y + h))
+        if not new_boxes:
             messagebox.showinfo(t("Info"), t("No watermarks detected"))
             return
+        self._push_undo()
+        self.rects.extend(new_boxes)
         self._redraw_overlay()
         self._update_coord_text()
-        self.log(t("Detected {} candidate region(s)").format(added))
+        self.log(t("Detected {} candidate region(s)").format(len(new_boxes)))
 
     # -------------------- save
     def save_to_source(self):
@@ -2229,6 +2452,18 @@ class WatermarkRemover:
         r.image = p2
 
     # -------------------- platform templates
+    def _on_compare_down(self, _):
+        if self.comparing or not self.undo_stack or self.cv_image is None:
+            return
+        self.comparing = True
+        self.display_image()
+
+    def _on_compare_up(self, _):
+        if not self.comparing:
+            return
+        self.comparing = False
+        self.display_image()
+
     def apply_platform_template(self, name):
         if self.cv_image is None:
             messagebox.showwarning(t("Warning"), t("Please open an image first"))
@@ -2236,6 +2471,7 @@ class WatermarkRemover:
         tpl = PLATFORM_TEMPLATES.get(name)
         if not tpl:
             return
+        self._push_undo()
         h, w = self.cv_image.shape[:2]
         for rx1, ry1, rx2, ry2 in tpl:
             self.rects.append((rx1 * w, ry1 * h, rx2 * w, ry2 * h))
@@ -2292,90 +2528,6 @@ class WatermarkRemover:
         self.loupe_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.loupe_canvas.delete("all")
         self.loupe_canvas.create_image(170, 170, image=self.loupe_photo)
-
-    # -------------------- remove preview + deep clean
-    def _preview_remove_result(self, new_image):
-        """Show a modal side-by-side; returns True if user hits Apply."""
-        top = tk.Toplevel(self.root)
-        top.title(t("Preview result"))
-        top.geometry("1200x720")
-        top.transient(self.root)
-        top.grab_set()
-
-        def _photo_of(img, maxw, maxh):
-            h, w = img.shape[:2]
-            s = min(maxw / w, maxh / h, 1.0)
-            nw, nh = max(1, int(w * s)), max(1, int(h * s))
-            rgb = cv2.cvtColor(cv2.resize(img, (nw, nh)), cv2.COLOR_BGR2RGB)
-            return ImageTk.PhotoImage(Image.fromarray(rgb))
-
-        body = tk.Frame(top)
-        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        lf = tk.Frame(body)
-        lf.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
-        rf = tk.Frame(body)
-        rf.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=4)
-        tk.Label(lf, text=t("Before"), font=("Arial", 11, "bold")).pack()
-        ll = tk.Label(lf)
-        ll.pack(fill=tk.BOTH, expand=True)
-        tk.Label(rf, text=t("After"), font=("Arial", 11, "bold")).pack()
-        rl = tk.Label(rf)
-        rl.pack(fill=tk.BOTH, expand=True)
-        top.update()
-        p1 = _photo_of(self.cv_image, 580, 620)
-        p2 = _photo_of(new_image, 580, 620)
-        ll.configure(image=p1)
-        rl.configure(image=p2)
-        ll.image = p1
-        rl.image = p2
-
-        decision = {"apply": False}
-
-        def _apply():
-            decision["apply"] = True
-            top.destroy()
-
-        def _cancel():
-            decision["apply"] = False
-            top.destroy()
-
-        bar = tk.Frame(top)
-        bar.pack(fill=tk.X, pady=6)
-        tk.Button(bar, text=t("Apply"), command=_apply, bg="lightgreen",
-                  font=("Arial", 11, "bold"), width=14).pack(side=tk.RIGHT, padx=8)
-        tk.Button(bar, text=t("Cancel"), command=_cancel, bg="lightgray",
-                  width=14).pack(side=tk.RIGHT, padx=4)
-        top.protocol("WM_DELETE_WINDOW", _cancel)
-        top.wait_window()
-        return decision["apply"]
-
-    def deep_clean(self, max_passes=3):
-        if self.cv_image is None:
-            messagebox.showerror(t("Error"), t("Please open an image first"))
-            return
-        # Either use existing selection OR seed from auto-detect.
-        if not self.rects and (self.extra_mask is None or self.extra_mask.max() == 0):
-            cands = auto_detect_regions(self.cv_image)
-            if not cands:
-                messagebox.showinfo(t("Info"), t("No watermarks detected"))
-                return
-            self.rects.extend(cands)
-            self._redraw_overlay()
-
-        for pass_idx in range(1, max_passes + 1):
-            self.log(t("Deep clean pass {}/{}").format(pass_idx, max_passes))
-            if not self.rects and (self.extra_mask is None or self.extra_mask.max() == 0):
-                self.log(t("Nothing detected after pass {}. Stopping.").format(pass_idx - 1))
-                break
-            if not self._remove_core(show_preview=False):
-                break
-            new_cands = auto_detect_regions(self.cv_image)
-            if not new_cands:
-                self.log(t("Nothing detected after pass {}. Stopping.").format(pass_idx))
-                break
-            self.rects.extend(new_cands)
-        self.display_image()
-        self._update_coord_text()
 
     # -------------------- video
     def open_video(self):
